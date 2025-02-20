@@ -1,6 +1,6 @@
 # BLK-BLEDOB Controller
 
-![Application Interface](Data\01.png)
+![Application Interface](Data/01.png)
 
 ## Features ✨
 
