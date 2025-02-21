@@ -1,6 +1,15 @@
 {
-  "last_color": "#ff1466",
-  "last_brightness": 13,
-  "power_state": false,
-  "window_geometry": "01d9d0cb000300000000036f0000016d000006b8000003f8000003700000018c000006b7000003f700000000000000000a00000003700000018c000006b7000003f7"
+  "last_color": "#fe01fe",
+  "last_brightness": 100,
+  "power_state": true,
+  "window_geometry": "01d9d0cb0003000000000350000000f1000007390000040f0000035100000110000007380000040e00000000000000000a000000035100000110000007380000040e",
+  "auto_connect": true,
+  "last_device": "BE:27:3F:01:70:EB",
+  "last_effect": "yellow fade",
+  "last_effect_speed": 50,
+  "last_hsv": [
+    300,
+    254,
+    254
+  ]
 }

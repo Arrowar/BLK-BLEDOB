@@ -1,78 +1,76 @@
+# 20.02.25
+
 import sys
-import json
+import math
 import asyncio
 import signal
-from pathlib import Path
-from PyQt5 import QtWidgets, QtCore, QtGui
-from bleak import BleakScanner, BleakClient
 import qasync
 
-# BLE Configuration
-SERVICE_UUIDS = [
-    "ffd0",
-    "fff0",
-    "0000ffd0-0000-1000-8000-00805f9b34fb",
-    "0000fff0-0000-1000-8000-00805f9b34fb"
-]
-WRITE_UUIDS = [
-    "ffd4",
-    "fff3",
-    "0000ffd4-0000-1000-8000-00805f9b34fb",
-    "0000fff3-0000-1000-8000-00805f9b34fb"
-]
+from PyQt5 import QtWidgets, QtCore, QtGui
+from bleak import BleakScanner, BleakClient
 
-class SettingsManager:
-    """Manages application settings with JSON persistence"""
-    def __init__(self):
-        self.settings_file = Path("settings.json")
-        self.default_settings = {
-            "last_color": "#7e57c2",
-            "last_brightness": 75,
-            "power_state": False,
-            "window_geometry": None
-        }
-        self.settings = self.default_settings.copy()
-        
-    def load_settings(self):
-        """Load settings from JSON file"""
-        try:
-            if self.settings_file.exists():
-                with open(self.settings_file, 'r') as f:
-                    self.settings.update(json.load(f))
-        except Exception as e:
-            print(f"Settings error: {e}")
-            self.reset_settings()
+from Src.const import WRITE_UUIDS, EFFECTS
+from Src.settings import SettingsManager, normalize_uuid
+from Src.util import build_command
 
-    def save_settings(self):
-        """Save settings to JSON file"""
-        try:
-            with open(self.settings_file, 'w') as f:
-                json.dump(self.settings, f, indent=2)
-        except Exception as e:
-            print(f"Settings error: {e}")
 
-    def reset_settings(self):
-        """Reset to default settings"""
-        self.settings = self.default_settings.copy()
-
-def normalize_uuid(uuid_str: str) -> str:
-    """Normalize BLE UUID to 4-character format"""
-    return uuid_str.lower().replace("-", "")[4:8]
-
+# Variable
 EXPECTED_WRITE_NORMS = [normalize_uuid(u) for u in WRITE_UUIDS]
 
-def build_command(command_type: str, value) -> bytes:
-    """Generate BLE command bytes based on command type"""
-    if command_type == 'power':
-        return bytes.fromhex('7e0704ff00010201ef' if value else '7e07040000000201ef')
-    elif command_type == 'color':
-        hex_color = value.lstrip('#')
-        r, g, b = (int(hex_color[i:i+2], 16) for i in range(0, 6, 2))
-        return bytes([0x7e, 0x07, 0x05, 0x03, r, g, b, 0x10, 0xef])
-    elif command_type == 'brightness':
-        level = min(max(round(value * 2.55), 0), 255)
-        return bytes([0x7E, 0x04, 0x01, level, 0x01, 0xFF, 0x02, 0x01, 0xEF])
-    raise ValueError("Invalid command type")
+
+class ColorWheel(QtWidgets.QWidget):
+    """Custom color wheel widget"""
+    colorChanged = QtCore.pyqtSignal(QtGui.QColor)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(200, 200)
+        self.color = QtGui.QColor.fromHsv(0, 255, 255)
+        
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        
+        center = QtCore.QPointF(self.width() / 2, self.height() / 2)
+        radius = min(self.width(), self.height()) / 2 - 5
+        
+        points_per_degree = 3
+        for i in range(360 * points_per_degree):
+            hue = i / points_per_degree
+            painter.setPen(QtGui.QPen(QtGui.QColor.fromHsv(int(hue), 255, 255), 2))
+            angle = math.radians(hue)
+            point = QtCore.QPointF(
+                center.x() + radius * math.cos(angle),
+                center.y() - radius * math.sin(angle)
+            )
+            painter.drawPoint(point)
+            
+        # Draw selected color marker
+        painter.setPen(QtGui.QPen(QtCore.Qt.black, 2))
+        angle = math.radians(self.color.hue())
+        marker_point = QtCore.QPointF(
+            center.x() + radius * math.cos(angle),
+            center.y() - radius * math.sin(angle)
+        )
+        painter.drawEllipse(marker_point, 5, 5)
+
+    def mousePressEvent(self, event):
+        self.updateColor(event.pos())
+        
+    def mouseMoveEvent(self, event):
+        self.updateColor(event.pos())
+        
+    def updateColor(self, pos):
+        center = QtCore.QPointF(self.width() / 2, self.height() / 2)
+        angle = math.atan2(center.y() - pos.y(), pos.x() - center.x())
+        hue = math.degrees(angle)
+        if hue < 0:
+            hue += 360
+        
+        self.color.setHsv(int(hue), self.color.saturation(), self.color.value())
+        self.colorChanged.emit(self.color)
+        self.update()
+
 
 class MainWindow(QtWidgets.QMainWindow):
     """Modern BLE LED Controller Interface"""
@@ -85,15 +83,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.write_char = None
         self.ble_devices = []
         self.ble_lock = asyncio.Lock()
+        
+        # Store slider references
+        self.hue_slider = None
+        self.sat_slider = None
+        self.val_slider = None
+        
         self.init_ui()
         self.load_initial_state()
+        
+        if self.settings.settings["auto_connect"]:
+            asyncio.ensure_future(self.auto_connect_device())
 
     def init_ui(self):
-        """Initialize modern UI components"""
+        """Initialize the user interface"""
         self.setWindowTitle("BLK-BLEDOB Control")
-        self.setMinimumSize(840, 620)
+        self.setMinimumSize(1000, 700)
         
-        # Window geometry handling
         if self.settings.settings["window_geometry"]:
             self.restoreGeometry(QtCore.QByteArray.fromHex(
                 self.settings.settings["window_geometry"].encode()))
@@ -101,17 +107,7 @@ class MainWindow(QtWidgets.QMainWindow):
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
 
-        # UI Components
-        self.scan_button = self.create_button("Scan Devices")
-        self.devices_list = QtWidgets.QListWidget()
-        self.connect_button = self.create_button("Connect", enabled=False)
-        self.disconnect_button = self.create_button("Disconnect", enabled=False)
-        self.power_button = self.create_button("Power ON", enabled=False)
-        self.color_button = self.create_color_button()
-        self.brightness_slider = self.create_slider()
-        self.status_label = QtWidgets.QLabel("Status: Disconnected")
-
-        # Layout
+        # Create main layout
         main_layout = QtWidgets.QHBoxLayout()
         left_panel = self.create_left_panel()
         right_panel = self.create_right_panel()
@@ -119,14 +115,6 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addLayout(left_panel, 40)
         main_layout.addLayout(right_panel, 60)
         central_widget.setLayout(main_layout)
-
-        # Signal connections
-        self.scan_button.clicked.connect(self.scan_devices)
-        self.connect_button.clicked.connect(self.handle_connect)
-        self.disconnect_button.clicked.connect(self.handle_disconnect)
-        self.power_button.clicked.connect(self.toggle_power)
-        self.color_button.clicked.connect(self.choose_color)
-        self.brightness_slider.valueChanged.connect(self.change_brightness)
 
     def create_button(self, text, enabled=True):
         """Create styled buttons with modern look"""
@@ -151,23 +139,131 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         """)
         return btn
+    
+    def create_left_panel(self):
+        """Create the left panel with connection controls"""
+        panel = QtWidgets.QVBoxLayout()
+        panel.setContentsMargins(10, 10, 10, 10)
+        panel.setSpacing(15)
+        
+        # Connection controls
+        self.scan_button = self.create_button("Scan Devices")
+        self.devices_list = QtWidgets.QListWidget()
+        self.connect_button = self.create_button("Connect", enabled=False)
+        self.disconnect_button = self.create_button("Disconnect", enabled=False)
+        self.auto_connect_checkbox = QtWidgets.QCheckBox("Auto-connect on startup")
+        self.auto_connect_checkbox.setChecked(self.settings.settings["auto_connect"])
+        self.status_label = QtWidgets.QLabel("Status: Disconnected")
+        
+        panel.addWidget(self.scan_button)
+        panel.addWidget(QtWidgets.QLabel("Available Devices:"))
+        panel.addWidget(self.devices_list)
+        panel.addWidget(self.connect_button)
+        panel.addWidget(self.disconnect_button)
+        panel.addWidget(self.auto_connect_checkbox)
+        panel.addWidget(self.status_label)
+        
+        # Connect signals
+        self.scan_button.clicked.connect(self.scan_devices)
+        self.connect_button.clicked.connect(self.handle_connect)
+        self.disconnect_button.clicked.connect(self.handle_disconnect)
+        self.auto_connect_checkbox.stateChanged.connect(self.toggle_auto_connect)
+        
+        return panel
 
-    def create_color_button(self):
-        """Create color selection button"""
-        btn = QtWidgets.QPushButton()
-        btn.setFixedSize(100, 100)
-        btn.setStyleSheet("""
-            QPushButton {
-                border-radius: 50px;
-                border: 3px solid #ffffff;
-                background-color: %s;
-            }
-            QPushButton:hover {
-                border: 3px solid #64b5f6;
-            }
-        """ % self.settings.settings["last_color"])
-        btn.setEnabled(False)
-        return btn
+    def create_right_panel(self):
+        """Create the right panel with LED controls"""
+        panel = QtWidgets.QVBoxLayout()
+        panel.setContentsMargins(20, 30, 20, 20)
+        panel.setSpacing(25)
+        
+        # Power control
+        self.power_button = self.create_button("Power ON", enabled=False)
+        self.power_button.clicked.connect(self.toggle_power)
+        panel.addWidget(self.power_button)
+        
+        # Color controls
+        color_box = QtWidgets.QGroupBox("Color Control")
+        color_layout = QtWidgets.QVBoxLayout()
+        
+        self.color_wheel = ColorWheel()
+        self.color_wheel.colorChanged.connect(self.on_color_wheel_change)
+        self.color_wheel.setEnabled(False)
+        
+        # HSV sliders - store both container and slider references
+        hue_container, self.hue_slider = self.create_hsv_slider("Hue", 0, 359)
+        sat_container, self.sat_slider = self.create_hsv_slider("Saturation", 0, 100)
+        val_container, self.val_slider = self.create_hsv_slider("Value", 0, 100)
+        
+        color_layout.addWidget(self.color_wheel, 0, QtCore.Qt.AlignCenter)
+        color_layout.addWidget(hue_container)
+        color_layout.addWidget(sat_container)
+        color_layout.addWidget(val_container)
+        color_box.setLayout(color_layout)
+        panel.addWidget(color_box)
+        
+        effect_box = QtWidgets.QGroupBox("Effects")
+        effect_layout = QtWidgets.QVBoxLayout()
+        
+        self.effect_combo = QtWidgets.QComboBox()
+        self.effect_combo.addItems(sorted(EFFECTS.keys()))
+        self.effect_combo.currentTextChanged.connect(self.change_effect)
+        self.effect_combo.setEnabled(False)
+        
+        self.speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.speed_slider.setRange(1, 100)
+        self.speed_slider.setValue(self.settings.settings["last_effect_speed"])
+        self.speed_slider.valueChanged.connect(self.change_speed)
+        self.speed_slider.setEnabled(False)
+        
+        effect_layout.addWidget(QtWidgets.QLabel("Select Effect:"))
+        effect_layout.addWidget(self.effect_combo)
+        effect_layout.addWidget(QtWidgets.QLabel("Effect Speed:"))
+        effect_layout.addWidget(self.speed_slider)
+        effect_box.setLayout(effect_layout)
+        panel.addWidget(effect_box)
+        
+        # Brightness control
+        brightness_box = QtWidgets.QGroupBox("Brightness")
+        brightness_layout = QtWidgets.QVBoxLayout()
+        self.brightness_slider = self.create_slider()
+        self.brightness_slider.valueChanged.connect(self.change_brightness)
+        self.brightness_slider.setEnabled(False)
+        brightness_layout.addWidget(self.brightness_slider)
+        brightness_box.setLayout(brightness_layout)
+        panel.addWidget(brightness_box)
+        
+        return panel
+
+    def load_initial_state(self):
+        """Load saved settings and initialize UI state"""
+        self.brightness_slider.setValue(self.settings.settings["last_brightness"])
+        
+        if self.settings.settings["last_effect"]:
+            index = self.effect_combo.findText(self.settings.settings["last_effect"])
+            if index >= 0:
+                self.effect_combo.setCurrentIndex(index)
+        
+        # Set HSV values
+        h, s, v = self.settings.settings["last_hsv"]
+        self.hue_slider.setValue(h)
+        self.sat_slider.setValue(s)
+        self.val_slider.setValue(v)
+        
+        self.update_power_button()
+
+    def enable_controls(self, enabled):
+        """Enable or disable all control elements"""
+        self.power_button.setEnabled(enabled)
+        self.color_wheel.setEnabled(enabled)
+        self.hue_slider.setEnabled(enabled)
+        self.sat_slider.setEnabled(enabled)
+        self.val_slider.setEnabled(enabled)
+        self.effect_combo.setEnabled(enabled)
+        self.speed_slider.setEnabled(enabled)
+        self.brightness_slider.setEnabled(enabled)
+        self.disconnect_button.setEnabled(enabled)
+        self.connect_button.setEnabled(not enabled)
 
     def create_slider(self):
         """Create modern styled slider"""
@@ -193,70 +289,21 @@ class MainWindow(QtWidgets.QMainWindow):
         slider.setRange(0, 100)
         slider.setEnabled(False)
         return slider
+    
+    async def auto_connect_device(self):
+        """Attempt to auto-connect to last used device"""
+        if self.settings.settings["auto_connect"] and self.settings.settings["last_device"]:
+            self.status_label.setText("Status: Auto-connecting...")
+            devices = await BleakScanner.discover()
+            for dev in devices:
+                if dev.address == self.settings.settings["last_device"]:
+                    await self.connect_device_async(dev)
+                    break
 
-    def create_left_panel(self):
-        """Build left side panel layout"""
-        panel = QtWidgets.QVBoxLayout()
-        panel.setContentsMargins(10, 10, 10, 10)
-        panel.setSpacing(15)
-        
-        panel.addWidget(self.scan_button)
-        panel.addWidget(QtWidgets.QLabel("Available Devices:"))
-        panel.addWidget(self.devices_list)
-        panel.addWidget(self.connect_button)
-        panel.addWidget(self.disconnect_button)
-        panel.addWidget(self.status_label)
-        
-        return panel
-
-    def create_right_panel(self):
-        """Build right side control panel"""
-        panel = QtWidgets.QVBoxLayout()
-        panel.setContentsMargins(20, 30, 20, 20)
-        panel.setSpacing(25)
-        
-        control_box = QtWidgets.QGroupBox("LED Controls")
-        control_layout = QtWidgets.QVBoxLayout()
-        control_layout.setSpacing(25)
-        
-        control_layout.addWidget(self.power_button)
-        control_layout.addWidget(QtWidgets.QLabel("Color"), 0, QtCore.Qt.AlignCenter)
-        control_layout.addWidget(self.color_button, 0, QtCore.Qt.AlignCenter)
-        control_layout.addWidget(QtWidgets.QLabel("Brightness"))
-        control_layout.addWidget(self.brightness_slider)
-        
-        control_box.setLayout(control_layout)
-        panel.addWidget(control_box)
-        
-        return panel
-
-    def load_initial_state(self):
-        """Initialize UI from saved settings"""
-        self.brightness_slider.setValue(self.settings.settings["last_brightness"])
-        self.color_button.setStyleSheet(f"""
-            background-color: {self.settings.settings['last_color']};
-            border-radius: 50px;
-            border: 3px solid #ffffff;
-        """)
-        self.update_power_button()
-
-    def update_power_button(self):
-        """Update power button state"""
-        state = self.settings.settings["power_state"]
-        self.power_button.setText("Power OFF" if state else "Power ON")
-        color = "#81c784" if state else "#ef5350"
-        self.power_button.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {color};
-                color: white;
-            }}
-        """)
-
-    def closeEvent(self, event):
-        """Handle window close event"""
-        self.settings.settings["window_geometry"] = self.saveGeometry().toHex().data().decode()
+    def toggle_auto_connect(self, state):
+        """Toggle auto-connect setting"""
+        self.settings.settings["auto_connect"] = bool(state)
         self.settings.save_settings()
-        super().closeEvent(event)
 
     async def scan_devices_async(self):
         """Scan for BLE devices"""
@@ -266,8 +313,8 @@ class MainWindow(QtWidgets.QMainWindow):
             devices = await BleakScanner.discover()
             for dev in devices:
                 name = dev.name or "Unknown Device"
-                rssi = dev.rssi if hasattr(dev, "rssi") else "N/A"
-                item = QtWidgets.QListWidgetItem(f"{name} ({dev.address})")
+                rssi = dev.advertisement_data.rssi if hasattr(dev, "advertisement_data") and hasattr(dev.advertisement_data, "rssi") else "N/A"
+                item = QtWidgets.QListWidgetItem(f"{name} ({dev.address}) RSSI: {rssi}")
                 item.setData(QtCore.Qt.UserRole, dev)
                 self.devices_list.addItem(item)
             self.status_label.setText("Status: Scan completed")
@@ -277,8 +324,31 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"Scan error: {e}")
 
     def scan_devices(self):
-        """Start BLE scan"""
+        """Start BLE device scan"""
         asyncio.ensure_future(self.scan_devices_async())
+
+    async def connect_device_async(self, device):
+        """Connect to selected BLE device"""
+        self.status_label.setText("Status: Connecting...")
+        self.client = BleakClient(device.address)
+        
+        try:
+            async with self.ble_lock:
+                await self.client.connect()
+                self.connected_device = device
+                await self.setup_characteristics()
+                
+            self.status_label.setText(f"Connected: {device.name or device.address}")
+            self.settings.settings["last_device"] = device.address
+            self.enable_controls(True)
+            self.settings.settings["power_state"] = True
+            self.update_power_button()
+            self.settings.save_settings()
+            
+        except Exception as e:
+            self.status_label.setText("Status: Connection failed")
+            print(f"Connection error: {e}")
+            self.enable_controls(False)
 
     async def setup_characteristics(self):
         """Discover BLE characteristics"""
@@ -290,28 +360,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     return
         raise Exception("No write characteristic found")
 
-    async def connect_device_async(self, device):
-        """Connect to selected device"""
-        self.status_label.setText("Status: Connecting...")
-        self.client = BleakClient(device.address)
-        
-        try:
-            async with self.ble_lock:
-                await self.client.connect()
-                self.connected_device = device
-                await self.setup_characteristics()
-                
-            self.status_label.setText(f"Connected: {device.name or device.address}")
-            self.enable_controls(True)
-            self.settings.settings["power_state"] = True
-            self.update_power_button()
-            self.settings.save_settings()
-            
-        except Exception as e:
-            self.status_label.setText("Status: Connection failed")
-            print(f"Connection error: {e}")
-            self.enable_controls(False)
-
     def handle_connect(self):
         """Handle connect button click"""
         if selected := self.devices_list.selectedItems():
@@ -320,9 +368,11 @@ class MainWindow(QtWidgets.QMainWindow):
     async def disconnect_device_async(self):
         """Disconnect from current device"""
         self.enable_controls(False)
+
         if self.client and self.client.is_connected:
             async with self.ble_lock:
                 await self.client.disconnect()
+
         self.client = None
         self.connected_device = None
         self.write_char = None
@@ -334,14 +384,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def handle_disconnect(self):
         """Handle disconnect button click"""
         asyncio.ensure_future(self.disconnect_device_async())
-
-    def enable_controls(self, enabled):
-        """Enable/disable control elements"""
-        self.power_button.setEnabled(enabled)
-        self.color_button.setEnabled(enabled)
-        self.brightness_slider.setEnabled(enabled)
-        self.disconnect_button.setEnabled(enabled)
-        self.connect_button.setEnabled(not enabled)
 
     async def send_command_async(self, command_type, value):
         """Send command to BLE device"""
@@ -355,6 +397,23 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             print(f"Command error: {e}")
 
+    def create_hsv_slider(self, label, min_val, max_val):
+        """Create HSV slider with label"""
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout()
+        lbl = QtWidgets.QLabel(label)
+        
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.valueChanged.connect(self.update_color_from_sliders)
+        slider.setEnabled(False)
+
+        layout.addWidget(lbl)
+        layout.addWidget(slider)
+        container.setLayout(layout)
+
+        return container, slider
+
     def toggle_power(self):
         """Toggle LED power state"""
         new_state = not self.settings.settings["power_state"]
@@ -363,25 +422,68 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_power_button()
         self.settings.save_settings()
 
-    def choose_color(self):
-        """Select and set LED color"""
-        color = QtWidgets.QColorDialog.getColor(initial=QtGui.QColor(self.settings.settings["last_color"]))
-        if color.isValid():
-            hex_color = color.name()
-            self.settings.settings["last_color"] = hex_color
-            self.color_button.setStyleSheet(f"""
-                background-color: {hex_color};
-                border-radius: 50px;
-                border: 3px solid #ffffff;
-            """)
-            asyncio.ensure_future(self.send_command_async('color', hex_color))
-            self.settings.save_settings()
+    def update_power_button(self):
+        """Update power button appearance"""
+        state = self.settings.settings["power_state"]
+        self.power_button.setText("Power OFF" if state else "Power ON")
+        color = "#81c784" if state else "#ef5350"
+        self.power_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {color};
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 6px;
+                font-size: 14px;
+                min-width: 120px;
+            }}
+        """)
+
+    def on_color_wheel_change(self, color):
+        """Handle color wheel selection"""
+        hex_color = color.name()
+        asyncio.ensure_future(self.send_command_async('color', hex_color))
+        self.settings.settings["last_color"] = hex_color
+        self.settings.settings["last_hsv"] = (color.hue(), color.saturation(), color.value())
+        self.settings.save_settings()
+
+    def update_color_from_sliders(self):
+        """Update color based on HSV slider values"""
+        if not all([self.hue_slider, self.sat_slider, self.val_slider]):
+            return
+            
+        h = self.hue_slider.value()
+        s = int(self.sat_slider.value() * 2.55)
+        v = int(self.val_slider.value() * 2.55)
+        
+        color = QtGui.QColor.fromHsv(h, s, v)
+        self.color_wheel.color = color
+        self.color_wheel.update()
+        self.on_color_wheel_change(color)
+
+    def change_effect(self, effect):
+        """Change LED effect"""
+        asyncio.ensure_future(self.send_command_async('effect', effect))
+        self.settings.settings["last_effect"] = effect
+        self.settings.save_settings()
+
+    def change_speed(self, speed):
+        """Change effect speed"""
+        asyncio.ensure_future(self.send_command_async('speed', speed))
+        self.settings.settings["last_effect_speed"] = speed
+        self.settings.save_settings()
 
     def change_brightness(self, value):
-        """Adjust LED brightness"""
+        """Change LED brightness"""
         self.settings.settings["last_brightness"] = value
         asyncio.ensure_future(self.send_command_async('brightness', value))
         self.settings.save_settings()
+
+    def closeEvent(self, event):
+        """Handle window close event"""
+        self.settings.settings["window_geometry"] = self.saveGeometry().toHex().data().decode()
+        self.settings.save_settings()
+        super().closeEvent(event)
 
 def apply_dark_theme(app):
     """Apply modern dark theme"""
